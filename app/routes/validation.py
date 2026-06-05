@@ -5,6 +5,10 @@ GET  /validate           — runs the full assertion suite, returns JSON results
 POST /validate/reset     — clears captured envelopes for a fresh run
 POST /validate/trigger   — drives the critical + high-volume endpoints, flushes
                            both batchers, then runs the assertion suite
+
+This validates a *split-routing* setup: critical metrics live exclusively in
+the critical project, non-critical metrics live exclusively in the primary
+project. No duplication across projects.
 """
 import json
 
@@ -20,8 +24,7 @@ from app.sentry_config import (
 
 router = APIRouter()
 
-# Metric names that legitimately belong in the critical transport (i.e. those
-# emitted via emit_critical_metric). Everything else must NOT appear there.
+# Metric names routed exclusively to the critical project.
 CRITICAL_METRIC_NAMES = {
     "payment_webhook_failure",
     "subscription_change_failure",
@@ -42,7 +45,6 @@ def extract_metrics(transport):
 
 
 def metric_name(m):
-    """The metric name lives under 'name' in the trace_metric item."""
     return m.get("name")
 
 
@@ -62,14 +64,10 @@ def get_attribute_value(attributes, key):
 
 def normalize_attributes(attributes):
     """Flatten an attributes dict to {key: value} regardless of shape."""
-    result = {}
-    for key in (attributes or {}):
-        result[key] = get_attribute_value(attributes, key)
-    return result
+    return {k: get_attribute_value(attributes, k) for k in (attributes or {})}
 
 
 def flush_batchers():
-    """Flush both clients' metric batchers so envelopes are captured."""
     primary_client = sentry_sdk.get_client()
     if getattr(primary_client, "metrics_batcher", None):
         primary_client.metrics_batcher.flush()
@@ -79,82 +77,130 @@ def flush_batchers():
         crit.metrics_batcher.flush()
 
 
-# Explicit attributes each critical metric was emitted with, used by CHECK 4.
 EXPECTED_ATTRIBUTES = {
     "payment_webhook_failure": {"error_type": "timeout", "plan": "enterprise"},
     "subscription_change_failure": {"error_type": "card_declined", "plan": "enterprise"},
     "sso_connect_failure": {"error_type": "saml_assertion_invalid", "provider": "okta"},
 }
 
+# Critical metric name → endpoint that emits it. The validator hits each
+# endpoint, captures its returned trace_id, and later asserts the critical
+# envelope's trace_id matches.
+CRITICAL_ENDPOINTS = {
+    "payment_webhook_failure": "/api/v1/payment/webhook",
+    "subscription_change_failure": "/api/v1/payment/subscription",
+    "sso_connect_failure": "/api/v1/enterprise/sso/connect",
+}
 
-def build_checks():
+
+def build_checks(expected_trace_ids=None):
+    """
+    expected_trace_ids: {metric_name: trace_id} captured from each critical
+    endpoint's response. When None, the trace-id check is skipped (used by
+    GET /validate against whatever happens to be in the buffers).
+    """
     primary_metrics = extract_metrics(primary_transport)
     critical_metrics = extract_metrics(critical_transport)
 
     primary_names = [metric_name(m) for m in primary_metrics]
     critical_names = [metric_name(m) for m in critical_metrics]
+    primary_set = set(primary_names)
+    critical_set = set(critical_names)
 
     checks = []
 
-    # ---- CHECK 1: DUAL_DELIVERY ----------------------------------------
-    critical_seen = sorted(set(critical_names) & CRITICAL_METRIC_NAMES)
-    dual_pass = (
-        len(primary_metrics) > 0
-        and CRITICAL_METRIC_NAMES.issubset(set(primary_names))
-        and set(critical_names) == CRITICAL_METRIC_NAMES
+    # ---- CHECK 1: SPLIT_ROUTING ----------------------------------------
+    # Primary received the non-critical metric; critical received the
+    # critical metrics — and neither side contains anything from the
+    # other.
+    leaked_to_primary = sorted(primary_set & CRITICAL_METRIC_NAMES)
+    leaked_to_critical = sorted(critical_set - CRITICAL_METRIC_NAMES)
+    critical_present = sorted(critical_set & CRITICAL_METRIC_NAMES)
+    non_critical_present = sorted(primary_set - CRITICAL_METRIC_NAMES)
+    split_pass = (
+        len(leaked_to_primary) == 0
+        and len(leaked_to_critical) == 0
+        and len(critical_present) > 0
+        and len(non_critical_present) > 0
     )
     checks.append({
-        "name": "DUAL_DELIVERY",
-        "passed": dual_pass,
+        "name": "SPLIT_ROUTING",
+        "passed": split_pass,
         "detail": (
-            f"Primary: {len(primary_metrics)} metrics, "
-            f"Critical: {len(critical_metrics)} metrics "
-            f"({', '.join(critical_seen)})"
+            f"Primary: {len(primary_metrics)} metrics ({', '.join(non_critical_present)}); "
+            f"Critical: {len(critical_metrics)} metrics ({', '.join(critical_present)})"
+        ),
+        "data": {
+            "primary_metric_names": non_critical_present,
+            "critical_metric_names": critical_present,
+        },
+    })
+
+    # ---- CHECK 2: PRIMARY_ISOLATION ------------------------------------
+    # No critical metric leaked into the primary project.
+    primary_iso_pass = len(leaked_to_primary) == 0
+    checks.append({
+        "name": "PRIMARY_ISOLATION",
+        "passed": primary_iso_pass,
+        "detail": (
+            "Primary transport contains no critical metrics"
+            if primary_iso_pass
+            else f"Primary transport leaked critical metrics: {leaked_to_primary}"
         ),
     })
 
-    # ---- CHECK 2: CRITICAL_ISOLATION -----------------------------------
-    non_critical = sorted(set(critical_names) - CRITICAL_METRIC_NAMES)
-    isolation_pass = len(non_critical) == 0
+    # ---- CHECK 3: CRITICAL_ISOLATION -----------------------------------
+    # No non-critical metric leaked into the critical project.
+    crit_iso_pass = len(leaked_to_critical) == 0
     checks.append({
         "name": "CRITICAL_ISOLATION",
-        "passed": isolation_pass,
+        "passed": crit_iso_pass,
         "detail": (
-            "Critical transport has 0 non-critical metrics "
-            "(api_request_total not present)"
-            if isolation_pass
-            else f"Critical transport contains non-critical metrics: {non_critical}"
+            "Critical transport contains no non-critical metrics (api_request_total absent)"
+            if crit_iso_pass
+            else f"Critical transport leaked non-critical metrics: {leaked_to_critical}"
         ),
     })
 
-    # ---- CHECK 3: TRACE_ID_PRESERVATION --------------------------------
+    # ---- CHECK 4: TRACE_ID_PRESERVATION --------------------------------
+    # Each critical envelope's trace_id equals the trace_id the FastAPI
+    # integration attached to the active scope at emit time, as reported
+    # by the endpoint's response.
     trace_data = {}
     trace_pass = True
-    for name in sorted(CRITICAL_METRIC_NAMES):
-        p = next((m for m in primary_metrics if metric_name(m) == name), None)
-        c = next((m for m in critical_metrics if metric_name(m) == name), None)
-        p_tid = p.get("trace_id") if p else None
-        c_tid = c.get("trace_id") if c else None
-        match = p_tid is not None and p_tid == c_tid
-        if not match:
-            trace_pass = False
-        trace_data[name] = {
-            "primary_trace_id": p_tid,
-            "critical_trace_id": c_tid,
-            "match": match,
-        }
+    if expected_trace_ids is None:
+        trace_detail = "skipped — call POST /validate/trigger to verify trace_id preservation"
+        trace_pass = True
+    else:
+        for name in sorted(CRITICAL_METRIC_NAMES):
+            c = next((m for m in critical_metrics if metric_name(m) == name), None)
+            envelope_tid = c.get("trace_id") if c else None
+            expected_tid = expected_trace_ids.get(name)
+            match = (
+                envelope_tid is not None
+                and expected_tid is not None
+                and envelope_tid == expected_tid
+            )
+            if not match:
+                trace_pass = False
+            trace_data[name] = {
+                "expected_trace_id": expected_tid,
+                "envelope_trace_id": envelope_tid,
+                "match": match,
+            }
+        trace_detail = (
+            "Every critical envelope's trace_id matches the active transaction's trace_id at emit time"
+            if trace_pass
+            else "One or more critical metrics have a mismatched/missing trace_id"
+        )
     checks.append({
         "name": "TRACE_ID_PRESERVATION",
         "passed": trace_pass,
-        "detail": (
-            "All critical metrics carry matching trace_id from their request's active span"
-            if trace_pass
-            else "One or more critical metrics have a mismatched/missing trace_id"
-        ),
+        "detail": trace_detail,
         "data": trace_data,
     })
 
-    # ---- CHECK 4: ATTRIBUTES_PRESERVED ---------------------------------
+    # ---- CHECK 5: ATTRIBUTES_PRESERVED ---------------------------------
     attr_data = {}
     attr_pass = True
     for name in sorted(CRITICAL_METRIC_NAMES):
@@ -176,10 +222,8 @@ def build_checks():
         "data": attr_data,
     })
 
-    # ---- CHECK 5: SCOPE_ISOLATION --------------------------------------
-    current = sentry_sdk.get_client()
-    crit = get_critical_client()
-    scope_pass = current is not crit
+    # ---- CHECK 6: SCOPE_ISOLATION --------------------------------------
+    scope_pass = sentry_sdk.get_client() is not get_critical_client()
     checks.append({
         "name": "SCOPE_ISOLATION",
         "passed": scope_pass,
@@ -192,11 +236,11 @@ def build_checks():
 
     passed_count = sum(1 for c in checks if c["passed"])
     total = len(checks)
-    if passed_count == total:
-        summary = f"{passed_count}/{total} PASSED"
-    else:
-        summary = f"{passed_count}/{total} PASSED, {total - passed_count} FAILED"
-
+    summary = (
+        f"{passed_count}/{total} PASSED"
+        if passed_count == total
+        else f"{passed_count}/{total} PASSED, {total - passed_count} FAILED"
+    )
     return {"summary": summary, "checks": checks}
 
 
@@ -218,14 +262,15 @@ async def validate_trigger():
     primary_transport.clear()
     critical_transport.clear()
 
-    # Step B: Make internal requests via ASGI transport (no real network).
+    # Step B: Drive endpoints over the ASGI transport (no real network).
     from app.main import app
 
+    expected_trace_ids = {}
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
-        await client.post("/api/v1/payment/webhook", json={})
-        await client.post("/api/v1/payment/subscription", json={})
-        await client.post("/api/v1/enterprise/sso/connect", json={})
+        for metric, path in CRITICAL_ENDPOINTS.items():
+            r = await client.post(path, json={})
+            expected_trace_ids[metric] = r.json().get("trace_id")
         await client.post("/api/email/signin", json={})
         await client.get("/api/warmup")
 
@@ -233,4 +278,4 @@ async def validate_trigger():
     flush_batchers()
 
     # Step D + E: Extract and assert
-    return build_checks()
+    return build_checks(expected_trace_ids=expected_trace_ids)

@@ -1,13 +1,15 @@
 """
-The dual-emit helper — the core of what we're validating.
+The split-routing helper — the core of what we're validating.
 
-emit_critical_metric() sends a metric twice:
-  1. To the primary project via the normal path (full scope).
-  2. To the critical project via a forked scope with a swapped client.
+emit_critical_metric() routes the metric *only* to the critical project, by
+forking the active scope and swapping the client. The primary client never
+sees critical metrics; the critical client never sees the routine,
+high-volume metrics emitted via plain sentry_sdk.metrics.count().
 
 The forked scope natively carries the active span's trace_id, request tags,
 and user context — everything the FastAPI integration attached to the current
-scope — so the critical copy stays fully trace-correlated.
+scope — so the critical metric stays fully trace-correlated and can be
+joined back to its primary-side trace via trace_id.
 """
 import sentry_sdk
 
@@ -21,17 +23,13 @@ def configure(client):
 
 def emit_critical_metric(name, value=1, attributes=None):
     """
-    Dual-emit: primary project (normal path) + critical project
-    (forked scope, low volume, full accuracy).
+    Route a metric to the critical project only.
 
     scope.client is set via direct attribute assignment (not set_client())
     to avoid a side effect that writes to the global scope.
     """
-    # 1. Primary — normal path, full scope
-    sentry_sdk.metrics.count(name, value, attributes=attributes)
-
-    # 2. Critical — forked scope, swapped client
-    if _critical_client is not None:
-        with sentry_sdk.new_scope() as scope:
-            scope.client = _critical_client
-            sentry_sdk.metrics.count(name, value, attributes=attributes)
+    if _critical_client is None:
+        return
+    with sentry_sdk.new_scope() as scope:
+        scope.client = _critical_client
+        sentry_sdk.metrics.count(name, value, attributes=attributes)
