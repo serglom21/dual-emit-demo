@@ -108,6 +108,7 @@ Other endpoints:
 
 - `GET /validate` — run the assertions against whatever is currently captured (skips the trace_id check, which needs the trigger's bookkeeping).
 - `POST /validate/reset` — clear both transports for a fresh run.
+- `POST /validate/stress` — exercise the edges (error attribution, PII, gauges, concurrency, broken DSN, SDK contract). See `STRESS_TEST.md` for the full breakdown of what it covers and what requires manual UI verification.
 
 ## How it captures metrics for inspection
 

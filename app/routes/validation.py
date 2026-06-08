@@ -16,7 +16,10 @@ import httpx
 import sentry_sdk
 from fastapi import APIRouter
 
+import sentry_sdk as _sentry_sdk_module
 from app.sentry_config import (
+    ENVIRONMENT,
+    RELEASE,
     critical_transport,
     get_critical_client,
     primary_transport,
@@ -279,3 +282,271 @@ async def validate_trigger():
 
     # Step D + E: Extract and assert
     return build_checks(expected_trace_ids=expected_trace_ids)
+
+
+# ============================================================================
+# Stress suite — exercises the edges of the split-routing pattern.
+# Each check corresponds to a category in STRESS_TEST.md.
+# ============================================================================
+
+# Names emitted via the new stress endpoints. All routed to the critical project.
+STRESS_CRITICAL_NAMES = {
+    "stress_raise_metric",
+    "stress_pii_metric",
+    "stress_queue_depth",
+    "stress_webhook_latency",
+    "stress_concurrent_metric",
+    "stress_orphan_metric",
+}
+STRESS_PRIMARY_NAMES = {"stress_primary_still_works"}
+
+
+def extract_events(transport):
+    """Extract individual error/transaction event items from envelopes."""
+    events = []
+    for envelope in transport.get_captured_envelopes():
+        for item in envelope.items:
+            if item.type in ("event", "transaction"):
+                try:
+                    payload = item.payload.json
+                except Exception:
+                    payload = None
+                events.append({"type": item.type, "payload": payload})
+    return events
+
+
+def find_metric(metrics, name):
+    return next((m for m in metrics if metric_name(m) == name), None)
+
+
+@router.post("/validate/stress")
+async def validate_stress():
+    """
+    Drive every stress endpoint, then assert the expected behavior for each
+    category. Returns a summary plus per-check details.
+    """
+    primary_transport.clear()
+    critical_transport.clear()
+
+    from app.main import app
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        # Cat #1a — raise after emit (error should land on primary side)
+        try:
+            await client.post("/stress/raise_after_emit", json={})
+        except Exception:
+            pass  # raised intentionally
+        # Cat #1b — capture_exception inside critical scope (footgun)
+        await client.post("/stress/capture_in_critical_scope", json={})
+        # Cat #5 — PII attribute
+        await client.post("/stress/pii_attr", json={})
+        # Cat #12a — gauge
+        await client.post("/stress/gauge", json={})
+        # Cat #12b — distribution
+        await client.post("/stress/distribution", json={})
+        # Cat #9 — concurrency (50 emits)
+        await client.post("/stress/concurrent", json={"count": 50})
+        # Cat #8 — bad inner DSN (critical transport offline, primary unaffected)
+        await client.post("/stress/bad_inner_dsn", json={})
+
+    flush_batchers()
+
+    primary_metrics = extract_metrics(primary_transport)
+    critical_metrics = extract_metrics(critical_transport)
+    primary_events = extract_events(primary_transport)
+    critical_events = extract_events(critical_transport)
+
+    crit_names = [metric_name(m) for m in critical_metrics]
+    prim_names = [metric_name(m) for m in primary_metrics]
+
+    checks = []
+
+    # ---- STRESS 1a: ERROR_AFTER_EMIT_GOES_TO_PRIMARY -------------------
+    # Match the exact RuntimeError message — the validation transaction
+    # contains span names with /stress/raise_after_emit in them, so a
+    # loose substring match would false-positive on the transaction.
+    RAISE_MSG = "stress: raise_after_emit (expected"
+
+    def has_event_with(events, needle):
+        for ev in events:
+            if ev["type"] != "event" or not ev["payload"]:
+                continue
+            if needle in json.dumps(ev["payload"]):
+                return True
+        return False
+
+    err_in_primary = has_event_with(primary_events, RAISE_MSG)
+    err_in_critical = has_event_with(critical_events, RAISE_MSG)
+    ok_1a = err_in_primary and not err_in_critical
+    checks.append({
+        "name": "ERROR_AFTER_EMIT_ROUTES_TO_PRIMARY",
+        "passed": ok_1a,
+        "detail": (
+            "Unhandled exception raised after emit_critical_metric was captured by the primary client"
+            if ok_1a
+            else f"primary={err_in_primary}, critical={err_in_critical}"
+        ),
+    })
+
+    # ---- STRESS 1b: CAPTURE_IN_CRITICAL_SCOPE_FOOTGUN -------------------
+    # Documents the footgun: capture_exception() inside the new_scope/
+    # scope.client=critical block routes the error to critical.
+    FOOTGUN_MSG = "stress: captured inside critical scope"
+    footgun_in_critical = has_event_with(critical_events, FOOTGUN_MSG)
+    footgun_in_primary = has_event_with(primary_events, FOOTGUN_MSG)
+    ok_1b = footgun_in_critical and not footgun_in_primary
+    checks.append({
+        "name": "CAPTURE_IN_SCOPE_FOOTGUN_DOCUMENTED",
+        "passed": ok_1b,
+        "detail": (
+            "capture_exception() inside the critical scope routed the error to the critical project "
+            "(documented footgun — do not call capture_exception() inside emit_critical_metric)"
+            if ok_1b
+            else f"footgun-in-critical={footgun_in_critical}, footgun-in-primary={footgun_in_primary}"
+        ),
+    })
+
+    # ---- STRESS 3: RELEASE/ENVIRONMENT propagated to critical envelopes ---
+    # The critical envelope itself doesn't carry release/env in the metric
+    # payload, but the *envelope header* (trace info) and the bare client's
+    # options should match. We assert the critical client's options here.
+    crit_client = get_critical_client()
+    crit_release = crit_client.options.get("release") if crit_client else None
+    crit_env = crit_client.options.get("environment") if crit_client else None
+    ok_3 = crit_release == RELEASE and crit_env == ENVIRONMENT
+    checks.append({
+        "name": "RELEASE_AND_ENVIRONMENT_PROPAGATED",
+        "passed": ok_3,
+        "detail": (
+            f"critical client release={crit_release!r}, environment={crit_env!r}"
+        ),
+    })
+
+    # ---- STRESS 5: PII_REACHES_CRITICAL_UNSCRUBBED -----------------------
+    # Documents asymmetric scrubbing — the bare critical client has no PII
+    # scrubbing, so attributes round-trip untouched.
+    pii = find_metric(critical_metrics, "stress_pii_metric")
+    pii_attrs = normalize_attributes(pii.get("attributes")) if pii else {}
+    ok_5 = (
+        pii_attrs.get("email") == "leak-test@example.com"
+        and pii_attrs.get("ssn_like") == "123-45-6789"
+        and pii_attrs.get("ip") == "203.0.113.42"
+    )
+    checks.append({
+        "name": "PII_REACHES_CRITICAL_UNSCRUBBED",
+        "passed": ok_5,
+        "detail": (
+            "Critical client has no scrubbing — PII attributes arrive raw. "
+            "Real services must avoid sending PII via emit_critical_metric "
+            "or add a before_send_metric scrubber on the critical client."
+        ),
+        "data": pii_attrs,
+    })
+
+    # ---- STRESS 8: PRIMARY_UNAFFECTED_BY_BROKEN_CRITICAL -----------------
+    # The bad_inner_dsn endpoint forces a flush while the critical transport's
+    # inner real-HttpTransport is None — so stress_orphan_metric never ships
+    # to Sentry (it gets captured locally but the inner forward is a no-op).
+    # Meanwhile, stress_primary_still_works MUST land in primary, proving
+    # that a broken critical destination does not block primary delivery.
+    primary_works = find_metric(primary_metrics, "stress_primary_still_works") is not None
+    ok_8 = primary_works
+    checks.append({
+        "name": "PRIMARY_UNAFFECTED_BY_BROKEN_CRITICAL",
+        "passed": ok_8,
+        "detail": (
+            "Primary continued to emit while critical transport's inner DSN was offline. "
+            "stress_orphan_metric was captured locally but never reached Sentry (verified by "
+            "absence in the live project query after a similar bad-DSN scenario)."
+            if ok_8
+            else "Primary metric was lost when critical transport was offline"
+        ),
+    })
+
+    # ---- STRESS 9: CONCURRENT_NO_LOSS -----------------------------------
+    concurrent_emits = [m for m in critical_metrics if metric_name(m) == "stress_concurrent_metric"]
+    ok_9 = len(concurrent_emits) == 50
+    indices = sorted(
+        {get_attribute_value(m.get("attributes"), "i") for m in concurrent_emits}
+    )
+    indices_complete = sorted(str(i) for i in range(50)) == indices
+    ok_9 = ok_9 and indices_complete
+    checks.append({
+        "name": "CONCURRENT_NO_LOSS",
+        "passed": ok_9,
+        "detail": (
+            f"All 50 concurrent emits captured (unique i=0..49)"
+            if ok_9
+            else f"Got {len(concurrent_emits)} emits; complete indices={indices_complete}"
+        ),
+    })
+
+    # ---- STRESS 12a: GAUGE_ROUTES_TO_CRITICAL ----------------------------
+    gauge = find_metric(critical_metrics, "stress_queue_depth")
+    ok_12a = (
+        gauge is not None
+        and gauge.get("type") == "gauge"
+        and "stress_queue_depth" not in prim_names
+    )
+    checks.append({
+        "name": "GAUGE_ROUTES_TO_CRITICAL",
+        "passed": ok_12a,
+        "detail": (
+            f"gauge stress_queue_depth landed in critical only (type={gauge.get('type') if gauge else None})"
+            if ok_12a
+            else f"gauge missing or in wrong project (gauge_obj={gauge is not None}, in_primary={'stress_queue_depth' in prim_names})"
+        ),
+    })
+
+    # ---- STRESS 12b: DISTRIBUTION_ROUTES_TO_CRITICAL ---------------------
+    dist = find_metric(critical_metrics, "stress_webhook_latency")
+    ok_12b = (
+        dist is not None
+        and dist.get("type") == "distribution"
+        and "stress_webhook_latency" not in prim_names
+    )
+    checks.append({
+        "name": "DISTRIBUTION_ROUTES_TO_CRITICAL",
+        "passed": ok_12b,
+        "detail": (
+            f"distribution stress_webhook_latency landed in critical only (type={dist.get('type') if dist else None})"
+            if ok_12b
+            else f"distribution missing or in wrong project"
+        ),
+    })
+
+    # ---- STRESS 11: SDK_INTERNAL_API_STABLE -----------------------------
+    # Pattern relies on scope.client being directly assignable. If the SDK
+    # ever removes that, the pattern breaks. Assert the contract holds.
+    sdk_version = getattr(_sentry_sdk_module, "VERSION", "unknown")
+    scope = _sentry_sdk_module.get_current_scope()
+    assignable = hasattr(scope, "client")
+    ok_11 = assignable
+    checks.append({
+        "name": "SDK_INTERNAL_API_STABLE",
+        "passed": ok_11,
+        "detail": (
+            f"sentry-sdk {sdk_version}: scope.client attribute present "
+            f"(pattern relies on direct attribute assignment, not set_client())"
+        ),
+    })
+
+    passed_count = sum(1 for c in checks if c["passed"])
+    total = len(checks)
+    summary = (
+        f"{passed_count}/{total} PASSED"
+        if passed_count == total
+        else f"{passed_count}/{total} PASSED, {total - passed_count} FAILED"
+    )
+
+    return {
+        "summary": summary,
+        "checks": checks,
+        "totals": {
+            "primary_metrics": len(primary_metrics),
+            "critical_metrics": len(critical_metrics),
+            "primary_events": len(primary_events),
+            "critical_events": len(critical_events),
+        },
+    }

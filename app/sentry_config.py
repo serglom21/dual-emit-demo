@@ -1,18 +1,20 @@
 """
-Sentry transport and client setup for the dual-emit pattern.
+Sentry transport and client setup for the split-routing pattern.
 
 CaptureTransport stores envelopes in memory so the validation endpoint can
 inspect exactly what would be sent, AND (optionally) forwards them to a real
 HttpTransport so the same envelopes reach a live Sentry project.
 
 DSNs are read from environment variables:
-  SENTRY_PRIMARY_DSN   — your high-volume project DSN
-  SENTRY_CRITICAL_DSN  — your low-volume "critical metrics" project DSN
+  SENTRY_PRIMARY_DSN     — your high-volume project DSN
+  SENTRY_CRITICAL_DSN    — your low-volume "critical metrics" project DSN
+  SENTRY_RELEASE         — release identifier (e.g. git sha or "v1.2.3")
+  SENTRY_ENVIRONMENT     — "production" / "staging" / etc.
+  SENTRY_TRACES_SAMPLE_RATE — 0.0–1.0 (default 1.0 for the demo)
 
-If either env var is unset, that side falls back to a syntactically valid
-*fake* DSN and only the in-memory CaptureTransport runs — local validation
-still works (5/5 PASSED), but nothing is shipped to Sentry. This keeps the
-repo safe to publish: no real DSNs are committed.
+If either DSN is unset, that side falls back to a syntactically valid *fake*
+DSN and only the in-memory CaptureTransport runs — local validation still
+works, but nothing is shipped to Sentry.
 """
 import os
 from threading import Lock
@@ -23,8 +25,6 @@ from sentry_sdk.consts import DEFAULT_OPTIONS
 from sentry_sdk.transport import Transport, make_transport
 
 
-# Fake DSNs — syntactically valid, never resolve. Used when the env vars are
-# unset so the SDK can still initialize for local validation runs.
 _FAKE_PRIMARY_DSN = (
     "https://primarykey0000000000000000000000@o1.ingest.sentry.io/1111"
 )
@@ -35,9 +35,10 @@ _FAKE_CRITICAL_DSN = (
 PRIMARY_DSN = os.environ.get("SENTRY_PRIMARY_DSN") or _FAKE_PRIMARY_DSN
 CRITICAL_DSN = os.environ.get("SENTRY_CRITICAL_DSN") or _FAKE_CRITICAL_DSN
 
-# Only wire the real HttpTransport when a real DSN was provided. With fake
-# DSNs we still want CaptureTransport to work, but we must not try to ship
-# envelopes to a host that doesn't exist.
+RELEASE = os.environ.get("SENTRY_RELEASE", "dual-emit-demo@local")
+ENVIRONMENT = os.environ.get("SENTRY_ENVIRONMENT", "development")
+TRACES_SAMPLE_RATE = float(os.environ.get("SENTRY_TRACES_SAMPLE_RATE", "1.0"))
+
 _PRIMARY_IS_REAL = "SENTRY_PRIMARY_DSN" in os.environ
 _CRITICAL_IS_REAL = "SENTRY_CRITICAL_DSN" in os.environ
 
@@ -81,9 +82,9 @@ class CaptureTransport(Transport):
             self._inner.kill()
 
 
-# Module-level transport instances. Pass these *as instances* (not via a
-# lambda factory) — passing a callable routes through the SDK's deprecated
-# _FunctionTransport which drops trace_metric envelopes.
+# Pass these *as instances* (not via a lambda factory) — passing a callable
+# routes through the SDK's deprecated _FunctionTransport which drops
+# trace_metric envelopes.
 primary_transport = CaptureTransport()
 critical_transport = CaptureTransport()
 
@@ -99,11 +100,10 @@ def _build_real_transport(dsn):
 
 def init_sentry():
     """
-    Initialize the primary client (full integrations, high volume) and create
-    a bare critical client (no integrations, low volume, never downsampled).
-
-    Each CaptureTransport wraps a real HttpTransport so envelopes are both
-    captured locally (for validation) and shipped to the real Sentry project.
+    Initialize the primary client (full integrations) and create a bare
+    critical client (no integrations). Both clients are configured with the
+    same release / environment so critical-side metrics carry the same
+    deployment context as primary-side events.
     """
     global _critical_client
 
@@ -114,13 +114,17 @@ def init_sentry():
 
     sentry_sdk.init(
         dsn=PRIMARY_DSN,
-        traces_sample_rate=1.0,
+        release=RELEASE,
+        environment=ENVIRONMENT,
+        traces_sample_rate=TRACES_SAMPLE_RATE,
         transport=primary_transport,
         enable_tracing=True,
     )
 
     critical_client = Client(
         dsn=CRITICAL_DSN,
+        release=RELEASE,
+        environment=ENVIRONMENT,
         integrations=[],
         default_integrations=False,
         transport=critical_transport,
