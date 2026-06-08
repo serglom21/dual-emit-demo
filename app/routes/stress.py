@@ -2,11 +2,10 @@
 Stress endpoints — exercise the edges of the split-routing pattern so the
 validation suite can assert their behavior.
 
-These routes exist to make the limitations of the pattern *visible and
-testable*. Each one corresponds to a specific category from STRESS_TEST.md:
+Each one corresponds to a category in STRESS_TEST.md:
 
   POST /stress/raise_after_emit          — error attribution (cat #1a)
-  POST /stress/capture_in_critical_scope — footgun: capture_exception in scope (cat #1b)
+  POST /stress/capture_in_critical_scope — scope-redirect contract (cat #1b)
   POST /stress/pii_attr                  — PII reaches critical unscrubbed (cat #5)
   POST /stress/gauge                     — gauge type routes to critical (cat #12a)
   POST /stress/distribution              — distribution routes to critical (cat #12b)
@@ -51,10 +50,18 @@ async def raise_after_emit():
 @router.post("/stress/capture_in_critical_scope")
 async def capture_in_critical_scope():
     """
-    Demonstrates the footgun: if user code calls sentry_sdk.capture_exception()
-    *inside* a manually opened new_scope() with scope.client = critical_client,
-    the error goes to the critical project (not primary). This route does that
-    intentionally so the validation suite can document the behavior.
+    Confirms the scope-redirect contract: inside a manually opened
+    `with new_scope() as scope: scope.client = critical_client` block,
+    every SDK call (including capture_exception) uses the redirected
+    client. This is the documented, expected behavior of the scope/client
+    mechanism — the route exists so the validation suite can assert the
+    SDK still honors it.
+
+    The `emit_critical_metric` helper as shipped does NOT call
+    capture_exception inside its scope block, so following the helper
+    does not surface this behavior. If you write your own scope-swap
+    code and call capture_exception inside, the error goes to the
+    redirected client (by design).
     """
     sentry_sdk.set_tag("stress_case", "capture_in_critical_scope")
     critical_client = get_critical_client()
@@ -64,10 +71,12 @@ async def capture_in_critical_scope():
     with sentry_sdk.new_scope() as scope:
         scope.client = critical_client
         try:
-            raise RuntimeError("stress: captured inside critical scope (footgun)")
+            raise RuntimeError(
+                "stress: captured inside critical scope (expected scope-redirect)"
+            )
         except RuntimeError:
             sentry_sdk.capture_exception()
-    return {"status": "captured", "note": "error routed to critical (footgun)"}
+    return {"status": "captured", "note": "error routed to critical (scope redirect, as designed)"}
 
 
 @router.post("/stress/pii_attr")

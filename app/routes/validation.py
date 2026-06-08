@@ -337,7 +337,9 @@ async def validate_stress():
             await client.post("/stress/raise_after_emit", json={})
         except Exception:
             pass  # raised intentionally
-        # Cat #1b — capture_exception inside critical scope (footgun)
+        # Cat #1b — capture_exception inside critical scope (verifies the
+        # scope-redirect contract: SDK calls inside the block use the
+        # redirected client; this is expected behavior, not a flaw).
         await client.post("/stress/capture_in_critical_scope", json={})
         # Cat #5 — PII attribute
         await client.post("/stress/pii_attr", json={})
@@ -389,21 +391,28 @@ async def validate_stress():
         ),
     })
 
-    # ---- STRESS 1b: CAPTURE_IN_CRITICAL_SCOPE_FOOTGUN -------------------
-    # Documents the footgun: capture_exception() inside the new_scope/
-    # scope.client=critical block routes the error to critical.
-    FOOTGUN_MSG = "stress: captured inside critical scope"
-    footgun_in_critical = has_event_with(critical_events, FOOTGUN_MSG)
-    footgun_in_primary = has_event_with(primary_events, FOOTGUN_MSG)
-    ok_1b = footgun_in_critical and not footgun_in_primary
+    # ---- STRESS 1b: CAPTURE_IN_SCOPE_GOES_TO_REDIRECTED_CLIENT -----------
+    # Verifies the scope-redirect contract: inside `with new_scope() as scope:
+    # scope.client = critical_client`, every SDK call (including
+    # capture_exception) uses the redirected client. This is the documented,
+    # expected behavior of the scope/client mechanism — the test exists to
+    # confirm the SDK still honors it. emit_critical_metric() as shipped does
+    # not call capture_exception, so users following the helper don't surface
+    # this. If you DO route an error to the critical client deliberately, the
+    # event will be bare (no integrations, no symbolication) by construction.
+    REDIRECT_MARKER = "stress: captured inside critical scope"
+    err_in_critical = has_event_with(critical_events, REDIRECT_MARKER)
+    err_in_primary = has_event_with(primary_events, REDIRECT_MARKER)
+    ok_1b = err_in_critical and not err_in_primary
     checks.append({
-        "name": "CAPTURE_IN_SCOPE_FOOTGUN_DOCUMENTED",
+        "name": "CAPTURE_IN_SCOPE_GOES_TO_REDIRECTED_CLIENT",
         "passed": ok_1b,
         "detail": (
-            "capture_exception() inside the critical scope routed the error to the critical project "
-            "(documented footgun — do not call capture_exception() inside emit_critical_metric)"
+            "capture_exception() inside `with new_scope(): scope.client = critical` "
+            "routed the error to the critical project — expected behavior of the "
+            "scope-redirect mechanism. Test confirms the SDK contract still holds."
             if ok_1b
-            else f"footgun-in-critical={footgun_in_critical}, footgun-in-primary={footgun_in_primary}"
+            else f"in-critical={err_in_critical}, in-primary={err_in_primary}"
         ),
     })
 
